@@ -12,13 +12,14 @@ export type Substrate = '淤泥质' | '砂质' | '砂泥质';
 /** 修复方式：造林 / 补植 / 自然恢复 */
 export type RestoreMode = '造林' | '补植' | '自然恢复';
 
-/** 地块跟踪状态：跟踪中 / 已验收 */
-export type PlotState = '跟踪中' | '已验收';
+/** 地块跟踪状态：跟踪中 / 已验收 / 已移交养护 */
+export type PlotState = '跟踪中' | '已验收' | '已移交';
 
 export const TIDE_ZONE_OPTIONS: TideZone[] = ['低', '中', '高'];
 export const SUBSTRATE_OPTIONS: Substrate[] = ['淤泥质', '砂质', '砂泥质'];
 export const RESTORE_MODE_OPTIONS: RestoreMode[] = ['造林', '补植', '自然恢复'];
-export const PLOT_STATE_OPTIONS: PlotState[] = ['跟踪中', '已验收'];
+/** 「已移交」只能通过移交动作进入，地块表单里不可直接选 */
+export const PLOT_STATE_OPTIONS: PlotState[] = ['跟踪中', '已验收', '已移交'];
 
 export interface Plot {
   id: string;
@@ -34,7 +35,16 @@ export interface Plot {
   restoreMode: RestoreMode;
   /** 跟踪状态 */
   state: PlotState;
-  /** 缺株数（株）——补植完成后由此回写 */
+  /** 移交批次号：移交给养护队时写入；未移交为空串 */
+  handoverBatch: string;
+  /** 移交日期 YYYY-MM-DD；未移交为空串 */
+  handoverDate: string;
+  /**
+   * 只读留底：旧数据升级时按地块状态应补基线但补不齐（缺验收/栽植）时置 true，
+   * 数据先只读留着，两侧都不允许改写，补齐基线前不可发起养护对账。
+   */
+  readOnly: boolean;
+  /** 缺株数（株）——移交后冻结为基线值，补植完成回写仅作用于未移交地块 */
   missingCount: number;
   /** 最近一次补植/复壮回写日期 */
   lastReplantDate: string;

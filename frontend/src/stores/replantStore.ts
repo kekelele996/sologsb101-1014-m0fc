@@ -6,6 +6,7 @@
 import { create } from 'zustand';
 import type { Replant, ReplantDraft, ReplantState } from '../types/replant';
 import {
+  ROW_REVISION,
   advanceReplantState,
   db,
   exportSnapshot,
@@ -98,12 +99,20 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     if (draft === undefined) return;
     const existing = await db.replants.get(replantId);
     if (!existing) return;
+    const plot = await db.plots.get(existing.plotId);
+    if (plot?.state === '已移交') {
+      throw new Error('地块已移交养护队，移交后的补苗对账在养护管护页处理，不能改这条补植计划');
+    }
     await putReplant({ ...existing, ...draft } as Replant);
     get().clearDraft(replantId);
     set({ revision: get().revision + 1, lastMessage: '草稿已保存到补植计划' });
   },
 
   async createReplant(draft) {
+    const plot = await db.plots.get(draft.plotId);
+    if (plot?.state === '已移交') {
+      throw new Error('地块已移交养护队，补苗由养护队按移交基线对账，不在项目部新建补植计划');
+    }
     const stamp = nowIso();
     const row: Replant = {
       id: uuid('replant'),
@@ -114,7 +123,7 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putReplant(row);
     set({ revision: get().revision + 1 });
@@ -133,6 +142,10 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   async advance(replantId) {
     const existing = await db.replants.get(replantId);
     if (!existing) return null;
+    const plot = await db.plots.get(existing.plotId);
+    if (plot?.state === '已移交' && existing.state !== '已复核') {
+      throw new Error('地块已移交养护队，移交后的补苗按基线对账，不在项目部推进补植状态');
+    }
     const index = FLOW.indexOf(existing.state);
     if (index < 0 || index >= FLOW.length - 1) return null;
     const next = FLOW[index + 1];
@@ -153,11 +166,23 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   async batchAdvance() {
     const ids = get().selectedIds;
     let count = 0;
+    const skipped: string[] = [];
     for (const id of ids) {
-      const next = await get().advance(id);
-      if (next !== null) count += 1;
+      try {
+        const next = await get().advance(id);
+        if (next !== null) count += 1;
+      } catch (err) {
+        // 已移交地块等被规则挡住的，跳过且不中断其余计划
+        skipped.push(err instanceof Error ? err.message : '有计划被跳过');
+      }
     }
-    set({ selectedIds: [], lastMessage: `已批量推进 ${count} 条补植计划` });
+    set({
+      selectedIds: [],
+      lastMessage:
+        skipped.length > 0
+          ? `已批量推进 ${count} 条；${skipped.length} 条被移交冻结规则跳过`
+          : `已批量推进 ${count} 条补植计划`,
+    });
     return count;
   },
 

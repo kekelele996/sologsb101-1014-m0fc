@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -171,6 +172,10 @@ export default function SurveyBoard() {
     }
   };
 
+  /** 该地块是否已移交：移交后项目部侧验收冻结，录入 / 编辑 / 删除 / 调级都要挡住 */
+  const plotHanded = (plotId: string): boolean =>
+    plots.find((item) => item.id === plotId)?.state === '已移交';
+
   const handleBulkGrade = async (): Promise<void> => {
     const count = await bulkApplyGrade(gradeDraft);
     if (count === 0) {
@@ -267,43 +272,61 @@ export default function SurveyBoard() {
     {
       title: '等级来源',
       key: 'gradeSource',
-      width: 110,
-      render: (_value, record) =>
-        record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>,
+      width: 130,
+      render: (_value, record) => {
+        if (plotHanded(record.plotId)) {
+          return (
+            <Tooltip title="地块已移交：项目部那版成活率停在移交当天，移交后的复查在养护管护台单独记">
+              <Tag color="purple">移交冻结</Tag>
+            </Tooltip>
+          );
+        }
+        return record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>;
+      },
     },
     {
       title: '操作',
       key: 'action',
       width: 150,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该测次记录？"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={async () => {
-              await deleteSurvey(record.id);
-              await remove(record.id);
-              message.success('验收记录已删除');
-            }}
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-              删除
-            </Button>
-          </Popconfirm>
-        </Space>
-      ),
+      render: (_value, record) => {
+        const handed = plotHanded(record.plotId);
+        return (
+          <Space size={4}>
+            <Tooltip title={handed ? '地块已移交，项目部验收测次已冻结' : ''}>
+              <Button size="small" type="link" icon={<EditOutlined />} disabled={handed} onClick={() => openEdit(record)}>
+                编辑
+              </Button>
+            </Tooltip>
+            <Popconfirm
+              title="确认删除该测次记录？"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              disabled={handed}
+              onConfirm={async () => {
+                await deleteSurvey(record.id);
+                await remove(record.id);
+                message.success('验收记录已删除');
+              }}
+            >
+              <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={handed}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
   const warnPlots = plots.filter((plot) => {
     const stat = statOf(plot.id);
-    return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
+    return plot.state !== '已移交' && stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
   });
+
+  const handedPlots = plots.filter((plot) => plot.state === '已移交');
+  const currentFilterHanded =
+    filters.plotId !== 'all' ? plots.find((plot) => plot.id === filters.plotId)?.state === '已移交' : false;
 
   return (
     <div>
@@ -346,14 +369,24 @@ export default function SurveyBoard() {
         />
       ) : null}
 
+      {handedPlots.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`${handedPlots.length} 个地块已移交养护队`}
+          description="这些地块的项目部成活率停在移交当天那版，测次不可再改；移交后的补苗与复查在「养护管护台」按基线对账。"
+        />
+      ) : null}
+
       <Card
-        title="成活率与株高验收台"
+        title="成活率与株高验收台（项目部 · 移交前）"
         extra={
           <Space>
-            <Button icon={<ToolOutlined />} onClick={() => void handleGenerateReplant()}>
+            <Button icon={<ToolOutlined />} onClick={() => void handleGenerateReplant()} disabled={currentFilterHanded}>
               生成补植计划
             </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plots.length === 0}>
+            <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plots.length === 0 || currentFilterHanded}>
               录入测次
             </Button>
           </Space>
@@ -440,6 +473,8 @@ export default function SurveyBoard() {
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
+              // 已移交地块的测次已冻结，不允许勾选做批量调级
+              getCheckboxProps: (record) => ({ disabled: plotHanded(record.plotId) }),
             }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{

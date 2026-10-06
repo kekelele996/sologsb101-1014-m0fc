@@ -5,7 +5,7 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import { ROW_REVISION, db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
@@ -84,6 +84,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async createSurvey(draft) {
+    const plot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (plot?.state === '已移交') {
+      throw new Error('地块已移交养护队，项目部侧验收测次已冻结；移交后的复查请在养护管护页登记');
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     const stamp = nowIso();
@@ -99,7 +103,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       gradeManual: false,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSurvey(row);
     set({ revision: get().revision + 1 });
@@ -109,6 +113,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async updateSurvey(surveyId, draft) {
     const existing = await db.surveys.get(surveyId);
     if (!existing) return;
+    const plot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (plot?.state === '已移交') {
+      throw new Error('地块已移交养护队，移交当天那版成活率已冻结，不能再改');
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     await putSurvey({
@@ -131,6 +139,12 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async bulkApplyGrade(level) {
     const ids = get().selectedIds;
     if (ids.length === 0) return 0;
+    const plots = usePlotStore.getState().plots;
+    const rows = await db.surveys.bulkGet(ids);
+    const touchesHanded = rows.some((row) => row && plots.find((plot) => plot.id === row.plotId)?.state === '已移交');
+    if (touchesHanded) {
+      throw new Error('所选记录包含已移交地块，移交当天那版成活率已冻结，不能调整等级');
+    }
     // 人工复核只改写等级标注，不改写实测成活率数值，保证数据可追溯
     await patchSurveyGrades(ids, level);
     set({ revision: get().revision + 1, lastMessage: `已批量调整 ${ids.length} 条验收记录的成活率等级` });
@@ -138,9 +152,16 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async generateReplant(plotId) {
-    const summary = get().summaryOf(plotId);
     const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
+    if (plot.state === '已移交') {
+      return '地块已移交养护队，补苗由养护队按移交基线对账，项目部不再出补植计划';
+    }
+    const stat = usePlotStore.getState().statOf(plotId);
+    if (stat.careBlocked) {
+      return '该地块有养护作业单挂起复核中，挂起期间不出补植计划';
+    }
+    const summary = get().summaryOf(plotId);
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
@@ -154,7 +175,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;

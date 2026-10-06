@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
 } from 'antd';
@@ -59,6 +60,8 @@ export default function ReplantPlan() {
   const seedlings = usePlotStore((state) => state.seedlings);
   const plantings = usePlotStore((state) => state.plantings);
   const surveys = usePlotStore((state) => state.surveys);
+  const baselines = usePlotStore((state) => state.baselines);
+  const careRechecks = usePlotStore((state) => state.careRechecks);
   const statOf = usePlotStore((state) => state.statOf);
   const ready = usePlotStore((state) => state.ready);
 
@@ -88,6 +91,8 @@ export default function ReplantPlan() {
   const [form] = Form.useForm<ReplantFormValues>();
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
+  const plotHanded = (plotId: string): boolean => plots.find((item) => item.id === plotId)?.state === '已移交';
+  const plotBlocked = (plotId: string): boolean => statOf(plotId).careBlocked;
 
   const filtered = useMemo(() => {
     const key = filters.keyword.trim().toLowerCase();
@@ -116,7 +121,14 @@ export default function ReplantPlan() {
 
   const openCreate = (): void => {
     setEditing(null);
-    const plotId = filters.plotId !== 'all' ? filters.plotId : plots.length > 0 ? plots[0].id : '';
+    // 已移交地块的补苗归养护队对账，项目部补植计划只能选未移交地块
+    const available = plots.filter((plot) => plot.state !== '已移交');
+    const plotId =
+      filters.plotId !== 'all' && available.some((plot) => plot.id === filters.plotId)
+        ? filters.plotId
+        : available.length > 0
+          ? available[0].id
+          : '';
     const stat = statOf(plotId);
     form.setFieldsValue({
       plotId,
@@ -182,7 +194,7 @@ export default function ReplantPlan() {
   };
 
   const handleExportCsv = (): void => {
-    const filename = exportSummaryCsvFile(plots, seedlings, plantings, surveys, rows);
+    const filename = exportSummaryCsvFile(plots, seedlings, plantings, surveys, rows, baselines, careRechecks);
     message.success(`已导出成活率汇总 ${filename}`);
   };
 
@@ -217,17 +229,25 @@ export default function ReplantPlan() {
     {
       title: '地块',
       key: 'plot',
-      width: 200,
-      render: (_value, record) => (
-        <Space direction="vertical" size={0}>
-          <span>{plotName(record.plotId)}</span>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            最新成活率{' '}
-            {statOf(record.plotId).surveyCount > 0 ? percentText(statOf(record.plotId).latestRate) : '未验收'} ·
-            栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
-          </Typography.Text>
-        </Space>
-      ),
+      width: 210,
+      render: (_value, record) => {
+        const handed = plotHanded(record.plotId);
+        const blocked = plotBlocked(record.plotId);
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{plotName(record.plotId)}</span>
+            <Space size={4} wrap>
+              {handed ? <Tag color="purple">已移交·养护对账</Tag> : null}
+              {blocked ? <Tag color="orange">挂起不出计划</Tag> : null}
+            </Space>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              最新成活率{' '}
+              {statOf(record.plotId).surveyCount > 0 ? percentText(statOf(record.plotId).latestRate) : '未验收'} ·
+              栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
+            </Typography.Text>
+          </Space>
+        );
+      },
     },
     {
       title: '缺株数（株）',
@@ -305,7 +325,11 @@ export default function ReplantPlan() {
               size="small"
               type="primary"
               icon={<SaveOutlined />}
-              onClick={() => void saveDraft(record.id)}
+              onClick={() =>
+                void saveDraft(record.id).catch((error: unknown) => {
+                  message.error(error instanceof Error ? error.message : '草稿保存失败');
+                })
+              }
             >
               保存
             </Button>
@@ -334,36 +358,41 @@ export default function ReplantPlan() {
       key: 'action',
       width: 250,
       fixed: 'right',
-      render: (_value, record) => (
-        <Space size={4} wrap>
-          <Button
-            size="small"
-            type="link"
-            icon={<SyncOutlined />}
-            disabled={record.state === '已复核'}
-            onClick={() => void handleAdvance(record)}
-          >
-            推进状态
-          </Button>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该补植计划？"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={async () => {
-              await deleteReplant(record.id);
-              message.success('补植计划已删除');
-            }}
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-              删除
+      render: (_value, record) => {
+        const handed = plotHanded(record.plotId);
+        return (
+          <Space size={4} wrap>
+            <Tooltip title={handed ? '地块已移交养护队，移交后按基线对账，不在项目部推进' : ''}>
+              <Button
+                size="small"
+                type="link"
+                icon={<SyncOutlined />}
+                disabled={record.state === '已复核' || handed}
+                onClick={() => void handleAdvance(record)}
+              >
+                推进状态
+              </Button>
+            </Tooltip>
+            <Button size="small" type="link" icon={<EditOutlined />} disabled={handed} onClick={() => openEdit(record)}>
+              编辑
             </Button>
-          </Popconfirm>
-        </Space>
-      ),
+            <Popconfirm
+              title="确认删除该补植计划？"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={async () => {
+                await deleteReplant(record.id);
+                message.success('补植计划已删除');
+              }}
+            >
+              <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -416,7 +445,12 @@ export default function ReplantPlan() {
             <Button danger icon={<ClearOutlined />} onClick={handleReset}>
               重置演示数据
             </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plots.length === 0}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={openCreate}
+              disabled={plots.every((plot) => plot.state === '已移交')}
+            >
               新建补植计划
             </Button>
           </Space>
@@ -490,8 +524,17 @@ export default function ReplantPlan() {
         cancelText="取消"
       >
         <Form form={form} layout="vertical">
-          <Form.Item name="plotId" label="地块" rules={[{ required: true, message: '请选择地块' }]}>
-            <Select options={plots.map((plot) => ({ value: plot.id, label: plot.name }))} />
+          <Form.Item
+            name="plotId"
+            label="地块（仅未移交地块）"
+            rules={[{ required: true, message: '请选择地块' }]}
+            extra="已移交地块的补苗由养护队按移交基线对账，在养护管护台登记。"
+          >
+            <Select
+              options={plots
+                .filter((plot) => plot.state !== '已移交')
+                .map((plot) => ({ value: plot.id, label: plot.name }))}
+            />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item

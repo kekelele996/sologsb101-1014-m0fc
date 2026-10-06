@@ -9,8 +9,10 @@ import type { Survey } from '../types/survey';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import type { Replant } from '../types/replant';
+import type { HandoverBaseline } from '../types/handover';
+import type { CareRecheck } from '../types/care';
 import { RATE_LEVEL_LABEL } from '../types/survey';
-import { calcSurvivalRate, percentText, round1 } from './rate';
+import { calcSurvivalRate, percentText, rateLevel, round1 } from './rate';
 import { stampSuffix } from './id';
 
 /** 触发浏览器下载 */
@@ -45,7 +47,7 @@ export interface SnapshotParseResult {
   snapshot: DatabaseSnapshot | null;
 }
 
-/** 解析并校验导入的 JSON 存档 */
+/** 解析并校验导入的 JSON 存档（兼容 v1/v2 旧存档：新表缺失按空集合处理） */
 export function parseSnapshot(text: string): SnapshotParseResult {
   let raw: unknown;
   try {
@@ -67,22 +69,27 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     };
   }
-  const collections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
-  for (const key of collections) {
+  const requiredCollections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
+  for (const key of requiredCollections) {
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
+  const snapshot = data as DatabaseSnapshot;
+  if (!Array.isArray(snapshot.handoverBaselines)) snapshot.handoverBaselines = [];
+  if (!Array.isArray(snapshot.careRechecks)) snapshot.careRechecks = [];
+  return { ok: true, message: '存档校验通过。', snapshot };
 }
 
-/** 导出全部地块的成活率汇总 CSV */
+/** 导出全部地块的成活率汇总 CSV（已移交地块按移交基线冻结口径输出） */
 export function exportSummaryCsv(
   plots: Plot[],
   seedlings: Seedling[],
   plantings: Planting[],
   surveys: Survey[],
   replants: Replant[],
+  baselines: HandoverBaseline[] = [],
+  careRechecks: CareRecheck[] = [],
 ): string {
   const header = [
     '地块名',
@@ -103,16 +110,46 @@ export function exportSummaryCsv(
     '缺株数(株)',
     '补植计划数',
     '最近补植日期',
+    '是否已移交',
+    '移交日期',
+    '基线栽植(株)',
+    '基线成活(株)',
+    '基线缺株(株)',
+    '基线成活率(%)',
+    '已放行补苗(株)',
+    '挂起作业单数',
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
   plots.forEach((plot) => {
     const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
     const plotPlantings = plantings.filter((row) => row.plotId === plot.id);
-    const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
+    const projectBaseline = baselines.find((row) => row.plotId === plot.id && row.side === '项目部');
+    const plotSurveys = surveys
+      .filter((row) => row.plotId === plot.id)
+      .filter((row) => projectBaseline === undefined || row.round <= projectBaseline.surveyRound)
+      .sort((a, b) => a.round - b.round);
     const plotReplants = replants.filter((row) => row.plotId === plot.id);
-    const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
+    const total = projectBaseline
+      ? projectBaseline.totalCount
+      : plotPlantings.reduce((acc, row) => acc + row.count, 0);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
-    const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
+    const rate = projectBaseline
+      ? projectBaseline.survivalRate
+      : latest
+        ? calcSurvivalRate(latest.aliveCount, total)
+        : 0;
+    const plotCare = careRechecks.filter((row) => row.plotId === plot.id);
+    const acceptedReplant = plotCare
+      .filter((row) => (row.status === 'normal' || row.status === 'resolved') && row.kind === '补苗')
+      .reduce((acc, row) => acc + row.replantCount, 0);
+    const heldCount = plotCare.filter(
+      (row) => row.status === 'held' || row.status === 'mismatch' || row.status === 'overBaseline',
+    ).length;
+    const gradeLabel = projectBaseline
+      ? RATE_LEVEL_LABEL[rateLevel(projectBaseline.survivalRate)]
+      : latest
+        ? RATE_LEVEL_LABEL[latest.grade]
+        : '—';
     lines.push(
       [
         plot.name,
@@ -125,20 +162,32 @@ export function exportSummaryCsv(
         plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
         total,
         plotSurveys.length,
-        latest ? `第 ${latest.round} 测次` : '未验收',
-        latest ? latest.aliveCount : 0,
+        projectBaseline
+          ? `第 ${projectBaseline.surveyRound} 测次(移交冻结)`
+          : latest
+            ? `第 ${latest.round} 测次`
+            : '未验收',
+        projectBaseline ? projectBaseline.aliveCount : latest ? latest.aliveCount : 0,
         round1(rate),
-        latest ? RATE_LEVEL_LABEL[latest.grade] : '—',
+        gradeLabel,
         latest ? latest.avgHeightCm : 0,
         plot.missingCount,
         plotReplants.length,
         plot.lastReplantDate || '—',
+        plot.state === '已移交' ? '是' : '否',
+        plot.handoverDate || '—',
+        projectBaseline ? projectBaseline.totalCount : '',
+        projectBaseline ? projectBaseline.aliveCount : '',
+        projectBaseline ? projectBaseline.missingCount : '',
+        projectBaseline ? projectBaseline.survivalRate : '',
+        projectBaseline ? acceptedReplant : '',
+        projectBaseline ? heldCount : '',
       ]
         .map(csvCell)
         .join(','),
     );
   });
-  return `\uFEFF${lines.join('\n')}`;
+  return `﻿${lines.join('\n')}`;
 }
 
 /** 导出成活率汇总 CSV 文件 */
@@ -148,9 +197,15 @@ export function exportSummaryCsvFile(
   plantings: Planting[],
   surveys: Survey[],
   replants: Replant[],
+  baselines: HandoverBaseline[] = [],
+  careRechecks: CareRecheck[] = [],
 ): string {
   const filename = `红树林成活率汇总-${stampSuffix()}.csv`;
-  download(filename, exportSummaryCsv(plots, seedlings, plantings, surveys, replants), 'text/csv;charset=utf-8');
+  download(
+    filename,
+    exportSummaryCsv(plots, seedlings, plantings, surveys, replants, baselines, careRechecks),
+    'text/csv;charset=utf-8',
+  );
   return filename;
 }
 
@@ -167,7 +222,7 @@ export async function copyText(text: string): Promise<boolean> {
   return false;
 }
 
-/** 生成可复制的成活率通报纯文本 */
+/** 生成可复制的成活率通报纯文本（已移交地块标注基线冻结口径） */
 export function buildSummaryText(
   plots: Plot[],
   plantings: Planting[],
@@ -181,10 +236,11 @@ export function buildSummaryText(
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
     const pending = replants.filter((row) => row.plotId === plot.id && row.state !== '已复核').length;
+    const handedTag = plot.state === '已移交' ? '（已移交，成活率停在移交当天；补苗由养护队对账）' : '';
     lines.push(
       `· ${plot.name}（${plot.tideZone}潮位带 / ${plot.substrate}）栽植 ${total} 株，最新成活率 ${
         latest ? percentText(rate) : '未验收'
-      }，缺株 ${plot.missingCount} 株，待办补植 ${pending} 条`,
+      }，缺株 ${plot.missingCount} 株，待办补植 ${pending} 条${handedTag}`,
     );
   });
   return lines.join('\n');

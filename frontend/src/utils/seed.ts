@@ -1,6 +1,8 @@
 /**
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植
+ * v3 起额外演示「按移交切开」：北屿外滩 B 区已移交，两侧基线留底 + 养护队管护作业单
+ * （含一条超出基线缺株数、被挂起复核的补苗单）。
  * 所有 id 固定，保证 /plots/:id/seedlings、/plots/:id/plantings 深链一定命中真实数据。
  */
 import { db, ROW_REVISION } from './db';
@@ -9,6 +11,8 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
+import type { HandoverBaseline } from '../types/handover';
+import type { CareRecheck } from '../types/care';
 import { calcSurvivalRate, rateLevel } from './rate';
 
 const SEED_TIME = '2025-01-06T02:00:00.000Z';
@@ -19,6 +23,9 @@ export const SEED_IDS = {
   plotB: 'plot-xiwan-a',
   plotC: 'plot-beiyu-b',
 } as const;
+
+/** 北屿外滩 B 区的移交批次（固定，方便演示两侧留底与养护对账） */
+export const SEED_HANDOVER_C = 'handover-beiyu-b-seed';
 
 function plotRow(row: Omit<Plot, 'createdAt' | 'updatedAt' | 'revision'>): Plot {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
@@ -49,6 +56,14 @@ function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision'>):
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
+function baselineRow(row: Omit<HandoverBaseline, 'createdAt' | 'updatedAt' | 'revision'>): HandoverBaseline {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
+function careRow(row: Omit<CareRecheck, 'createdAt' | 'updatedAt' | 'revision'>): CareRecheck {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
 /**
  * 播种演示数据。调用方（initDatabase）已保证仅在主表为空时调用，因此天然幂等；
  * 这里再做一次防御：若已存在地块则直接返回。
@@ -57,7 +72,7 @@ export async function seedDatabase(): Promise<void> {
   const exists = await db.plots.count();
   if (exists > 0) return;
 
-  // ---------------- 地块（3 块，覆盖三种潮位带与三种底质） ----------------
+  // ---------------- 地块（3 块，覆盖三种潮位带与三种底质；C 已移交） ----------------
   const plots: Plot[] = [
     plotRow({
       id: SEED_IDS.plotA,
@@ -67,6 +82,9 @@ export async function seedDatabase(): Promise<void> {
       substrate: '淤泥质',
       restoreMode: '造林',
       state: '跟踪中',
+      handoverBatch: '',
+      handoverDate: '',
+      readOnly: false,
       missingCount: 1092,
       lastReplantDate: '',
     }),
@@ -78,6 +96,9 @@ export async function seedDatabase(): Promise<void> {
       substrate: '砂泥质',
       restoreMode: '补植',
       state: '跟踪中',
+      handoverBatch: '',
+      handoverDate: '',
+      readOnly: false,
       missingCount: 0,
       lastReplantDate: '2025-04-20',
     }),
@@ -88,7 +109,11 @@ export async function seedDatabase(): Promise<void> {
       tideZone: '高',
       substrate: '砂质',
       restoreMode: '造林',
-      state: '已验收',
+      state: '已移交',
+      handoverBatch: SEED_HANDOVER_C,
+      handoverDate: '2024-09-02',
+      readOnly: false,
+      // 移交后缺株数冻结为基线值 560（8000 - 7440），不随养护补苗回写
       missingCount: 560,
       lastReplantDate: '2024-11-08',
     }),
@@ -121,29 +146,118 @@ export async function seedDatabase(): Promise<void> {
     [SEED_IDS.plotC]: 8000,
   };
 
-  // ---------------- 验收记录（每地块 2–3 个测次） ----------------
+  // ---------------- 验收记录（每地块 2–3 个测次；C 的测次停在移交当天） ----------------
   const surveys: Survey[] = [
     surveyRow({ id: 'survey-a1', plotId: SEED_IDS.plotA, round: 1, date: '2024-06-20', aliveCount: 4680, avgHeightCm: 62 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-a2', plotId: SEED_IDS.plotA, round: 2, date: '2024-09-18', aliveCount: 4420, avgHeightCm: 78 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-a3', plotId: SEED_IDS.plotA, round: 3, date: '2025-03-15', aliveCount: 4108, avgHeightCm: 96 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-b1', plotId: SEED_IDS.plotB, round: 1, date: '2024-07-05', aliveCount: 2772, avgHeightCm: 41 }, totalByPlot[SEED_IDS.plotB]),
     surveyRow({ id: 'survey-b2', plotId: SEED_IDS.plotB, round: 2, date: '2024-10-12', aliveCount: 2112, avgHeightCm: 55 }, totalByPlot[SEED_IDS.plotB]),
+    // 北屿外滩 B 区：第 2 测次即移交当天那版，项目部成活率就此冻结
     surveyRow({ id: 'survey-c1', plotId: SEED_IDS.plotC, round: 1, date: '2024-05-28', aliveCount: 7680, avgHeightCm: 70 }, totalByPlot[SEED_IDS.plotC]),
     surveyRow({ id: 'survey-c2', plotId: SEED_IDS.plotC, round: 2, date: '2024-08-30', aliveCount: 7440, avgHeightCm: 88 }, totalByPlot[SEED_IDS.plotC]),
   ];
 
-  // ---------------- 补植计划（每地块 1 条，覆盖三种状态） ----------------
+  // ---------------- 补植计划（未移交地块；C 的移交后遗留单已复核留档） ----------------
   const replants: Replant[] = [
     replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }),
     replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '已补植' }),
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await db.plots.bulkPut(plots);
-    await db.seedlings.bulkPut(seedlings);
-    await db.plantings.bulkPut(plantings);
-    await db.surveys.bulkPut(surveys);
-    await db.replants.bulkPut(replants);
-  });
+  // ---------------- 移交基线（C 地块两侧各留一份，数据一致） ----------------
+  // 移交当天：栽植 8000 / 成活 7440 / 缺株 560 / 成活率 93.0% / 第 2 测次
+  const handoverBaselines: HandoverBaseline[] = [
+    baselineRow({
+      id: 'baseline-c-project',
+      plotId: SEED_IDS.plotC,
+      batch: SEED_HANDOVER_C,
+      side: '项目部',
+      handoverDate: '2024-09-02',
+      source: 'handover',
+      note: '移交当天基线留底（项目部），成活率停在此版',
+      totalCount: 8000,
+      aliveCount: 7440,
+      missingCount: 560,
+      survivalRate: 93.0,
+      surveyRound: 2,
+    }),
+    baselineRow({
+      id: 'baseline-c-care',
+      plotId: SEED_IDS.plotC,
+      batch: SEED_HANDOVER_C,
+      side: '养护队',
+      handoverDate: '2024-09-02',
+      source: 'handover',
+      note: '移交当天基线留底（养护队），补苗与复查按此对账',
+      totalCount: 8000,
+      aliveCount: 7440,
+      missingCount: 560,
+      survivalRate: 93.0,
+      surveyRound: 2,
+    }),
+  ];
+
+  // ---------------- 养护队管护作业单（补苗上报 / 复查，单独记） ----------------
+  const careRechecks: CareRecheck[] = [
+    // 第一批补苗 400 株：在基线缺株 560 内，对账一致
+    careRow({
+      id: 'care-c-replant-1',
+      plotId: SEED_IDS.plotC,
+      batch: SEED_HANDOVER_C,
+      kind: '补苗',
+      date: '2024-09-20',
+      replantCount: 400,
+      aliveCount: 0,
+      avgHeightCm: 0,
+      species: '无瓣海桑',
+      crew: '养护一班',
+      status: 'normal',
+      note: '按移交基线缺株补第一批',
+    }),
+    // 移交后复查：成活株数单独记（7440 + 400 已成活），不回写项目部验收
+    careRow({
+      id: 'care-c-recheck-1',
+      plotId: SEED_IDS.plotC,
+      batch: SEED_HANDOVER_C,
+      kind: '复查',
+      date: '2024-12-10',
+      replantCount: 0,
+      aliveCount: 7840,
+      avgHeightCm: 102,
+      species: '无瓣海桑',
+      crew: '养护一班',
+      status: 'normal',
+      note: '移交后首次复查，与基线口径一致',
+    }),
+    // 第二批补苗报 200 株：已放行 400 + 200 = 600 > 基线缺株 560，比基线多出，挂起复核
+    careRow({
+      id: 'care-c-replant-2',
+      plotId: SEED_IDS.plotC,
+      batch: SEED_HANDOVER_C,
+      kind: '补苗',
+      date: '2025-03-05',
+      replantCount: 200,
+      aliveCount: 0,
+      avgHeightCm: 0,
+      species: '白骨壤',
+      crew: '养护二班',
+      status: 'overBaseline',
+      note: '累计补苗将达 600 株，超过基线缺株 560 株，挂起复核，暂缓出补植计划',
+    }),
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.handoverBaselines, db.careRechecks],
+    async () => {
+      await db.plots.bulkPut(plots);
+      await db.seedlings.bulkPut(seedlings);
+      await db.plantings.bulkPut(plantings);
+      await db.surveys.bulkPut(surveys);
+      await db.replants.bulkPut(replants);
+      await db.handoverBaselines.bulkPut(handoverBaselines);
+      await db.careRechecks.bulkPut(careRechecks);
+    },
+  );
 }

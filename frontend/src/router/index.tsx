@@ -12,6 +12,7 @@ const SeedlingBoard = lazy(() => import('../pages/SeedlingBoard'));
 const PlantingEntry = lazy(() => import('../pages/PlantingEntry'));
 const SurveyBoard = lazy(() => import('../pages/SurveyBoard'));
 const ReplantPlan = lazy(() => import('../pages/ReplantPlan'));
+const CareBoard = lazy(() => import('../pages/CareBoard'));
 
 /** 路由路径常量：全项目唯一来源，避免手写字符串不一致 */
 export const ROUTES = {
@@ -20,6 +21,7 @@ export const ROUTES = {
   plantings: (plotId: string): string => `/plots/${plotId}/plantings`,
   surveys: '/surveys',
   replants: '/replants',
+  care: '/care',
 } as const;
 
 /** 懒加载页面占位 */
@@ -42,6 +44,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'plots/:id/plantings', element: withSuspense(<PlantingEntry />) },
       { path: 'surveys', element: withSuspense(<SurveyBoard />) },
       { path: 'replants', element: withSuspense(<ReplantPlan />) },
+      { path: 'care', element: withSuspense(<CareBoard />) },
       { path: '*', element: <Navigate to={ROUTES.plots} replace /> },
     ],
   },

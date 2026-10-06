@@ -9,12 +9,16 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { HandoverBaseline } from '../types/handover';
+import type { CareRecheck } from '../types/care';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
+  backfillCareBaseline,
   countAll,
   db,
   initDatabase,
+  performHandover,
   putPlot,
   removePlot,
 } from '../utils/db';
@@ -37,16 +41,26 @@ export interface PlotStat {
   seedlingQuantity: number;
   /** 栽植总株数（株） */
   plantTotal: number;
-  /** 验收测次数 */
+  /** 验收测次数（项目部口径，移交后停在移交当天那版） */
   surveyCount: number;
-  /** 最新成活率（%） */
+  /** 最新成活率（%）；已移交地块为移交当天冻结值 */
   latestRate: number;
   /** 最新等级 */
   level: RateLevel;
   /** 成活率环比变化（百分点） */
   trend: number;
-  /** 建议补植株数 */
+  /** 建议补植株数；已移交地块归养护队对账，恒为 0 */
   suggestReplant: number;
+  /** 是否已移交养护队 */
+  handedOver: boolean;
+  /** 是否为升级补不齐基线的只读留底 */
+  readOnly: boolean;
+  /** 养护侧基线留底是否缺失（可只补跑本侧） */
+  careBaselineMissing: boolean;
+  /** 移交日期 YYYY-MM-DD */
+  handoverDate: string;
+  /** 该地块是否有挂起中的养护作业单（挂起期间不出补植计划） */
+  careBlocked: boolean;
 }
 
 const EMPTY_FILTERS: PlotFilters = { keyword: '', tideZone: 'all', substrate: 'all' };
@@ -74,6 +88,10 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  /** 全部移交基线留底（项目部 + 养护队两侧） */
+  baselines: HandoverBaseline[];
+  /** 养护队管护作业单，用于派生各地块的挂起状态 */
+  careRechecks: CareRecheck[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -87,12 +105,18 @@ interface PlotStoreState {
   selectPlot: (plotId: string | null) => void;
   createPlot: (draft: PlotDraft) => Promise<Plot>;
   updatePlot: (plotId: string, draft: PlotDraft) => Promise<void>;
+  /** 移交地块给养护队：抄基线、两侧留底；返回养护侧是否写入成功 */
+  handoverPlot: (plotId: string, handoverDate: string, note: string) => Promise<{ careWritten: boolean; reason?: string }>;
+  /** 养护侧留底写不进去时，只补跑养护队本侧 */
+  backfillCare: (plotId: string) => Promise<void>;
   deletePlot: (plotId: string) => Promise<void>;
   setFilters: (patch: Partial<PlotFilters>) => void;
   resetFilters: () => void;
   visiblePlots: () => Plot[];
   statOf: (plotId: string) => PlotStat;
   summaryOf: (plotId: string | null) => SurvivalSummary;
+  projectBaselineOf: (plotId: string) => HandoverBaseline | undefined;
+  careBaselineOf: (plotId: string) => HandoverBaseline | undefined;
   refreshCounts: () => Promise<void>;
 }
 
@@ -105,6 +129,11 @@ const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   level: 'poor',
   trend: 0,
   suggestReplant: 0,
+  handedOver: false,
+  readOnly: false,
+  careBaselineMissing: false,
+  handoverDate: '',
+  careBlocked: false,
 };
 
 let subscribed = false;
@@ -114,6 +143,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  baselines: [],
+  careRechecks: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,21 +161,30 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, baselines, careRechecks] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.handoverBaselines.toArray(),
+            db.careRechecks.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, baselines, careRechecks };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, baselines, careRechecks }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
-              const summary = buildSurvivalSummary(plot.id, surveys, plantings);
+              const projectBaseline = baselines.find((row) => row.plotId === plot.id && row.side === '项目部');
+              const careBaseline = baselines.find((row) => row.plotId === plot.id && row.side === '养护队');
+              // 项目部那份成活率：已移交地块套用基线，停在移交当天那版
+              const summary = buildSurvivalSummary(plot.id, surveys, plantings, undefined, projectBaseline);
               summaries[plot.id] = summary;
+              const heldStatuses = new Set<CareRecheck['status']>(['held', 'mismatch', 'overBaseline']);
+              const careBlocked = careRechecks.some(
+                (row) => row.plotId === plot.id && heldStatuses.has(row.status),
+              );
               stats[plot.id] = {
                 plotId: plot.id,
                 seedlingCount: plotSeedlings.length,
@@ -155,6 +195,11 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
                 level: summary.level,
                 trend: summary.trend,
                 suggestReplant: summary.suggestReplant,
+                handedOver: summary.handedOver,
+                readOnly: plot.readOnly === true,
+                careBaselineMissing: projectBaseline !== undefined && careBaseline === undefined,
+                handoverDate: plot.handoverDate ?? '',
+                careBlocked,
               };
             });
             const sorted = [...plots].sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
@@ -165,6 +210,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              baselines,
+              careRechecks,
               stats,
               summaries,
               loading: false,
@@ -202,7 +249,11 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       tideZone: draft.tideZone,
       substrate: draft.substrate,
       restoreMode: draft.restoreMode,
-      state: draft.state,
+      // 「已移交」只能通过移交动作进入，新建时一律回到跟踪中
+      state: draft.state === '已移交' ? '跟踪中' : draft.state,
+      handoverBatch: '',
+      handoverDate: '',
+      readOnly: false,
       missingCount: 0,
       lastReplantDate: '',
       createdAt: stamp,
@@ -217,6 +268,23 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   async updatePlot(plotId, draft) {
     const existing = await db.plots.get(plotId);
     if (!existing) return;
+    // 已移交地块：项目部侧只允许改地块名，栽植/验收口径与移交状态一律冻结
+    if (existing.state === '已移交') {
+      await putPlot({
+        ...existing,
+        name: draft.name.trim() || existing.name,
+        state: '已移交',
+      });
+      return;
+    }
+    // 只读留底地块（升级补不齐基线）：同样只允许核对地块名，其余档案与只读标记原样保留
+    if (existing.readOnly) {
+      await putPlot({
+        ...existing,
+        name: draft.name.trim() || existing.name,
+      });
+      return;
+    }
     await putPlot({
       ...existing,
       name: draft.name.trim() || existing.name,
@@ -224,11 +292,31 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       tideZone: draft.tideZone,
       substrate: draft.substrate,
       restoreMode: draft.restoreMode,
-      state: draft.state,
+      state: draft.state === '已移交' ? existing.state : draft.state,
     });
   },
 
+  async handoverPlot(plotId, handoverDate, note) {
+    const result = await performHandover(plotId, handoverDate, note);
+    await get().refreshCounts();
+    return { careWritten: result.careWritten, reason: result.reason };
+  },
+
+  async backfillCare(plotId) {
+    await backfillCareBaseline(plotId);
+    await get().refreshCounts();
+  },
+
   async deletePlot(plotId) {
+    const existing = get().plots.find((plot) => plot.id === plotId);
+    // 已移交地块两侧均在管护留底，不允许在地块台账直接级联删除；只读留底地块也要保留待补基线
+    if (existing && (existing.state === '已移交' || existing.readOnly)) {
+      throw new Error(
+        existing.state === '已移交'
+          ? '地块已移交养护队，不能删除；如需清理请先联系养护队核账'
+          : '该地块为升级补不齐基线的只读留底，暂不可删除',
+      );
+    }
     await removePlot(plotId);
     if (get().currentPlotId === plotId) {
       get().selectPlot(null);
@@ -266,6 +354,14 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   summaryOf(plotId) {
     if (plotId === null) return buildSurvivalSummary('', [], []);
     return get().summaries[plotId] ?? buildSurvivalSummary(plotId, [], []);
+  },
+
+  projectBaselineOf(plotId) {
+    return get().baselines.find((row) => row.plotId === plotId && row.side === '项目部');
+  },
+
+  careBaselineOf(plotId) {
+    return get().baselines.find((row) => row.plotId === plotId && row.side === '养护队');
   },
 
   async refreshCounts() {
