@@ -1,7 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbmangrove
- * - 含数据结构版本号与 v1 → v2 升级迁移逻辑（升级时按 version().stores() 补齐索引）
+ * - 含数据结构版本号与 v1 → v2 → v3 升级迁移逻辑（升级时按 version().stores() 补齐索引）
+ * - v3 起按「移交」切开项目部 / 养护队：新增 handovers（移交基线，两边各自留底）与
+ *   careTasks（管护作业单）两张表，并按地块状态补基线，补不齐的标记「待补录」只读
  * - 提供各表增删改查、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -11,18 +13,21 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
+import type { Handover } from '../types/handover';
+import type { CareTask, CareTaskDraft } from '../types/care';
 import { rateLevel } from './rate';
-import { nowIso, today } from './id';
+import { deriveBaseline, reconcileCareTask } from './reconcile';
+import { nowIso, today, uuid } from './id';
 import { seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class MangroveDatabase extends Dexie {
   plots!: Table<Plot, string>;
@@ -30,6 +35,8 @@ class MangroveDatabase extends Dexie {
   plantings!: Table<Planting, string>;
   surveys!: Table<Survey, string>;
   replants!: Table<Replant, string>;
+  handovers!: Table<Handover, string>;
+  careTasks!: Table<CareTask, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +51,7 @@ class MangroveDatabase extends Dexie {
     });
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
         seedlings: 'id, plotId, species, source, arrivalDate, quantity',
@@ -80,6 +87,73 @@ class MangroveDatabase extends Dexie {
           if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
         });
+      });
+
+    // ---------- v3：按移交切开项目部 / 养护队 ----------
+    // 新增 handovers（移交基线，两边各自留底）与 careTasks（管护作业单）；
+    // 已有数据没有移交标记：按地块状态补基线——「已验收」地块能推齐基线的补移交，
+    // 补不齐的标记「待补录」只读留着。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots: 'id, name, tideZone, substrate, restoreMode, state, handoverState, createdAt, updatedAt',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade',
+        replants: 'id, plotId, planDate, state, species',
+        handovers: 'id, plotId, handoverDate',
+        careTasks: 'id, plotId, handoverId, workDate, state, kind',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：全部旧表行修订号对齐
+        const tables = [
+          tx.table('plots'),
+          tx.table('seedlings'),
+          tx.table('plantings'),
+          tx.table('surveys'),
+          tx.table('replants'),
+        ];
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+          });
+        }
+        // 迁移 2：按地块状态补移交基线
+        const plotRows = (await tx.table('plots').toArray()) as Array<Record<string, unknown>>;
+        for (const row of plotRows) {
+          if (typeof row.handoverState === 'string' && typeof row.handoverId === 'string') continue;
+          const plotId = String(row.id);
+          if (row.state !== '已验收') {
+            await tx.table('plots').update(plotId, { handoverState: '未移交', handoverId: '' });
+            continue;
+          }
+          const plantings = (await tx.table('plantings').where('plotId').equals(plotId).toArray()) as Planting[];
+          const surveys = (await tx.table('surveys').where('plotId').equals(plotId).toArray()) as Survey[];
+          const baseline = deriveBaseline(plantings, surveys);
+          if (baseline === null) {
+            // 基线补不齐：只读留着，等人工核对后再补录
+            await tx.table('plots').update(plotId, { handoverState: '待补录', handoverId: '' });
+            continue;
+          }
+          const stamp = nowIso();
+          const handover: Handover = {
+            id: uuid('handover'),
+            plotId,
+            handoverDate: typeof row.updatedAt === 'string' ? String(row.updatedAt).slice(0, 10) : today(),
+            projectCopy: { ...baseline },
+            maintenanceCopy: { ...baseline },
+            projectFrozen: true,
+            maintenanceFiled: true,
+            createdAt: stamp,
+            updatedAt: stamp,
+            revision: ROW_REVISION,
+          };
+          await tx.table('handovers').put(handover);
+          await tx.table('plots').update(plotId, {
+            handoverState: '已移交',
+            handoverId: handover.id,
+            missingCount: baseline.missingCount,
+          });
+        }
       });
   }
 }
@@ -126,13 +200,15 @@ export async function patchPlot(id: string, patch: Partial<Plot>): Promise<void>
   await db.plots.update(id, { ...patch, updatedAt: nowIso() });
 }
 
-/** 删除地块并级联清理其下苗木批次、栽植、验收与补植计划 */
+/** 删除地块并级联清理其下苗木批次、栽植、验收、补植计划、移交单与管护作业单 */
 export async function removePlot(id: string): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.handovers, db.careTasks], async () => {
     await db.seedlings.where('plotId').equals(id).delete();
     await db.plantings.where('plotId').equals(id).delete();
     await db.surveys.where('plotId').equals(id).delete();
     await db.replants.where('plotId').equals(id).delete();
+    await db.handovers.where('plotId').equals(id).delete();
+    await db.careTasks.where('plotId').equals(id).delete();
     await db.plots.delete(id);
   });
 }
@@ -236,6 +312,7 @@ export async function removeReplant(id: string): Promise<void> {
 /**
  * 补植完成回写：
  * 1）扣减地块缺株数；2）写入最近补植日期；3）按补植后的总株数重算最新一次验收的成活率。
+ * 已移交地块：项目部口径冻结在移交当天，缺株数与验收成活率都不回写（补苗走养护队管护作业单）。
  */
 export async function applyReplantCompletion(replantId: string): Promise<void> {
   await db.transaction('rw', db.plots, db.replants, db.surveys, db.plantings, async () => {
@@ -243,6 +320,7 @@ export async function applyReplantCompletion(replantId: string): Promise<void> {
     if (!replant) return;
     const plot = await db.plots.get(replant.plotId);
     if (!plot) return;
+    if (plot.handoverState === '已移交') return;
 
     const nextMissing = Math.max(0, plot.missingCount - replant.missingCount);
     await db.plots.update(plot.id, {
@@ -276,6 +354,153 @@ export async function advanceReplantState(replantId: string, next: ReplantState)
   }
 }
 
+/* ------------------------------ 移交（分侧落库） ------------------------------ */
+
+export async function listHandovers(): Promise<Handover[]> {
+  const rows = await db.handovers.toArray();
+  return rows.sort((a, b) => a.handoverDate.localeCompare(b.handoverDate));
+}
+
+export async function getHandoverByPlot(plotId: string): Promise<Handover | undefined> {
+  return db.handovers.where('plotId').equals(plotId).first();
+}
+
+/**
+ * 移交 · 项目部侧（独立事务）：
+ * 抄基线、写移交单（项目部留底）、冻结地块（缺株数对齐基线）。
+ * 养护队侧在此刻尚未建档（maintenanceFiled = false），由 fileMaintenanceSide 补齐。
+ * 幂等：已移交的地块直接返回既有移交单。
+ */
+export async function freezeProjectSide(plotId: string): Promise<Handover | null> {
+  return db.transaction('rw', db.plots, db.plantings, db.surveys, db.handovers, async () => {
+    const plot = await db.plots.get(plotId);
+    if (!plot) return null;
+    if (plot.handoverState === '已移交' && plot.handoverId !== '') {
+      return (await db.handovers.get(plot.handoverId)) ?? null;
+    }
+    const plantings = await db.plantings.where('plotId').equals(plotId).toArray();
+    const surveys = await db.surveys.where('plotId').equals(plotId).toArray();
+    const baseline = deriveBaseline(plantings, surveys);
+    if (baseline === null) return null;
+    const stamp = nowIso();
+    const handover: Handover = {
+      id: uuid('handover'),
+      plotId,
+      handoverDate: today(),
+      projectCopy: { ...baseline },
+      maintenanceCopy: { ...baseline },
+      projectFrozen: true,
+      maintenanceFiled: false,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    };
+    await db.handovers.put(handover);
+    await db.plots.update(plotId, {
+      handoverState: '已移交',
+      handoverId: handover.id,
+      missingCount: baseline.missingCount,
+      updatedAt: stamp,
+    });
+    return handover;
+  });
+}
+
+/**
+ * 移交 · 养护队侧（独立事务，写不进去时只补跑本侧）：
+ * 把项目部留底抄为养护队留底并建档。幂等：已建档直接返回 true。
+ */
+export async function fileMaintenanceSide(handoverId: string): Promise<boolean> {
+  return db.transaction('rw', db.handovers, async () => {
+    const handover = await db.handovers.get(handoverId);
+    if (!handover) return false;
+    if (handover.maintenanceFiled) return true;
+    await db.handovers.update(handoverId, {
+      maintenanceCopy: { ...handover.projectCopy },
+      maintenanceFiled: true,
+      updatedAt: nowIso(),
+    });
+    return true;
+  });
+}
+
+/**
+ * 一键移交：先项目部侧冻结，再养护队侧建档。
+ * 养护队侧写不进去时项目部侧不回滚，返回 maintenanceOk = false，由调用方补跑本侧。
+ */
+export async function handoverPlot(plotId: string): Promise<{ handover: Handover | null; maintenanceOk: boolean }> {
+  const handover = await freezeProjectSide(plotId);
+  if (handover === null) return { handover: null, maintenanceOk: false };
+  if (handover.maintenanceFiled) return { handover, maintenanceOk: true };
+  try {
+    const maintenanceOk = await fileMaintenanceSide(handover.id);
+    return { handover, maintenanceOk };
+  } catch {
+    return { handover, maintenanceOk: false };
+  }
+}
+
+/* ------------------------------ 管护作业单（养护队） ------------------------------ */
+
+export async function listCareTasks(): Promise<CareTask[]> {
+  const rows = await db.careTasks.toArray();
+  return rows.sort((a, b) => b.workDate.localeCompare(a.workDate));
+}
+
+export async function listCareTasksByPlot(plotId: string): Promise<CareTask[]> {
+  const rows = await db.careTasks.where('plotId').equals(plotId).toArray();
+  return rows.sort((a, b) => b.workDate.localeCompare(a.workDate));
+}
+
+/** 某地块已确认（正常状态）的补苗累计，用于对账 */
+export async function confirmedReplantTotal(plotId: string): Promise<number> {
+  const rows = await db.careTasks.where('plotId').equals(plotId).toArray();
+  return rows
+    .filter((row) => row.kind === '补苗' && row.state === '正常')
+    .reduce((acc, row) => acc + row.replantCount, 0);
+}
+
+/**
+ * 新增管护作业单并按基线对账（同一事务）：
+ * 对不上或比基线多出 → 挂起复核；地块未移交或养护队侧未建档时返回 null。
+ */
+export async function createCareTaskChecked(draft: CareTaskDraft): Promise<CareTask | null> {
+  return db.transaction('rw', db.plots, db.handovers, db.careTasks, async () => {
+    const plot = await db.plots.get(draft.plotId);
+    if (!plot || plot.handoverState !== '已移交' || plot.handoverId === '') return null;
+    const handover = await db.handovers.get(plot.handoverId);
+    if (!handover || !handover.maintenanceFiled) return null;
+    const confirmed = await confirmedReplantTotal(plot.id);
+    const check = reconcileCareTask(handover.maintenanceCopy, confirmed, draft);
+    const stamp = nowIso();
+    const row: CareTask = {
+      id: uuid('care'),
+      plotId: plot.id,
+      handoverId: handover.id,
+      kind: draft.kind,
+      workDate: draft.workDate,
+      replantCount: draft.kind === '补苗' ? draft.replantCount : 0,
+      recheckAliveCount: draft.kind === '复查' ? draft.recheckAliveCount : null,
+      state: check.ok ? '正常' : '挂起复核',
+      suspendReason: check.reason,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    };
+    await db.careTasks.put(row);
+    return row;
+  });
+}
+
+/** 复核放行：人工确认后解除挂起，该笔计入已确认累计 */
+export async function releaseCareTask(id: string): Promise<void> {
+  await db.careTasks.update(id, { state: '正常', suspendReason: '', updatedAt: nowIso() });
+}
+
+export async function removeCareTask(id: string): Promise<void> {
+  await db.careTasks.delete(id);
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -287,16 +512,20 @@ export interface DatabaseSnapshot {
   plantings: Planting[];
   surveys: Survey[];
   replants: Replant[];
+  handovers: Handover[];
+  careTasks: CareTask[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, handovers, careTasks] = await Promise.all([
     db.plots.toArray(),
     db.seedlings.toArray(),
     db.plantings.toArray(),
     db.surveys.toArray(),
     db.replants.toArray(),
+    db.handovers.toArray(),
+    db.careTasks.toArray(),
   ]);
   return {
     name: DB_NAME,
@@ -307,36 +536,89 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     plantings,
     surveys,
     replants,
+    handovers,
+    careTasks,
   };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/**
+ * 旧存档规范化：没有移交标记的地块按状态补基线（与 v3 迁移同口径），
+ * 补不齐的标记「待补录」只读；返回规范化后的地块与需补建的移交单。
+ */
+function normalizeSnapshotHandover(
+  plots: Plot[],
+  plantings: Planting[],
+  surveys: Survey[],
+): { plots: Plot[]; handovers: Handover[] } {
+  const extraHandovers: Handover[] = [];
+  const nextPlots = plots.map((plot) => {
+    if (typeof plot.handoverState === 'string' && typeof plot.handoverId === 'string') return plot;
+    if (plot.state !== '已验收') return { ...plot, handoverState: '未移交' as const, handoverId: '' };
+    const baseline = deriveBaseline(
+      plantings.filter((row) => row.plotId === plot.id),
+      surveys.filter((row) => row.plotId === plot.id),
+    );
+    if (baseline === null) return { ...plot, handoverState: '待补录' as const, handoverId: '' };
+    const stamp = nowIso();
+    const handover: Handover = {
+      id: uuid('handover'),
+      plotId: plot.id,
+      handoverDate: today(),
+      projectCopy: { ...baseline },
+      maintenanceCopy: { ...baseline },
+      projectFrozen: true,
+      maintenanceFiled: true,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    };
+    extraHandovers.push(handover);
+    return {
+      ...plot,
+      handoverState: '已移交' as const,
+      handoverId: handover.id,
+      missingCount: baseline.missingCount,
+    };
+  });
+  return { plots: nextPlots, handovers: extraHandovers };
+}
+
+/** 用快照覆盖整库（导入存档）；兼容没有移交表与移交标记的旧存档 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  const normalized = normalizeSnapshotHandover(snapshot.plots, snapshot.plantings, snapshot.surveys);
+  const handovers = [...(snapshot.handovers ?? []), ...normalized.handovers];
+  const careTasks = snapshot.careTasks ?? [];
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.handovers, db.careTasks], async () => {
     await Promise.all([
       db.plots.clear(),
       db.seedlings.clear(),
       db.plantings.clear(),
       db.surveys.clear(),
       db.replants.clear(),
+      db.handovers.clear(),
+      db.careTasks.clear(),
     ]);
-    await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.plots.bulkPut(normalized.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.handovers.bulkPut(handovers.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.careTasks.bulkPut(careTasks.map((row) => ({ ...row, revision: ROW_REVISION })));
   });
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.handovers, db.careTasks], async () => {
     await Promise.all([
       db.plots.clear(),
       db.seedlings.clear(),
       db.plantings.clear(),
       db.surveys.clear(),
       db.replants.clear(),
+      db.handovers.clear(),
+      db.careTasks.clear(),
     ]);
   });
   await seedDatabase();
@@ -344,12 +626,14 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, handovers, careTasks] = await Promise.all([
     db.plots.count(),
     db.seedlings.count(),
     db.plantings.count(),
     db.surveys.count(),
     db.replants.count(),
+    db.handovers.count(),
+    db.careTasks.count(),
   ]);
-  return { plots, seedlings, plantings, surveys, replants };
+  return { plots, seedlings, plantings, surveys, replants, handovers, careTasks };
 }

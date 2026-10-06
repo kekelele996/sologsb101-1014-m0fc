@@ -158,6 +158,12 @@ export default function SeedlingBoard() {
     );
   }
 
+  const readOnly = plot.handoverState !== '未移交';
+  const readOnlyReason =
+    plot.handoverState === '已移交'
+      ? '该地块已移交养护队，项目部侧（苗木批次、栽植记录、验收测次）冻结为只读。'
+      : '该地块升级时基线未补齐，标记为待补录，只读留着。';
+
   const columns: ColumnsType<Seedling> = [
     {
       title: '树种',
@@ -207,7 +213,7 @@ export default function SeedlingBoard() {
       width: 170,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button size="small" type="link" icon={<EditOutlined />} disabled={readOnly} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
@@ -218,7 +224,7 @@ export default function SeedlingBoard() {
             cancelText="取消"
             onConfirm={() => void handleDelete(record)}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={readOnly}>
               删除
             </Button>
           </Popconfirm>
@@ -273,10 +279,12 @@ export default function SeedlingBoard() {
         />
       ) : null}
 
+      {readOnly ? <Alert type="info" showIcon style={{ marginBottom: 14 }} message={readOnlyReason} /> : null}
+
       <Card
         title="苗木批次与来源"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={readOnly}>
             登记苗木批次
           </Button>
         }
@@ -285,8 +293,8 @@ export default function SeedlingBoard() {
           <EmptyPanel
             title="该地块还没有苗木批次"
             description="登记进场苗木的树种、来源、规格与数量，栽植记录才能引用到具体批次。"
-            actionText="登记第一批苗木"
-            onAction={openCreate}
+            actionText={readOnly ? undefined : '登记第一批苗木'}
+            onAction={readOnly ? undefined : openCreate}
           />
         ) : (
           <Table<Seedling>

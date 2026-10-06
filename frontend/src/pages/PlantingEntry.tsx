@@ -199,6 +199,12 @@ export default function PlantingEntry() {
     );
   }
 
+  const readOnly = plot.handoverState !== '未移交';
+  const readOnlyReason =
+    plot.handoverState === '已移交'
+      ? '该地块已移交养护队，项目部侧（苗木批次、栽植记录、验收测次）冻结为只读。'
+      : '该地块升级时基线未补齐，标记为待补录，只读留着。';
+
   const columns: ColumnsType<Planting> = [
     {
       title: '栽植日期',
@@ -264,7 +270,7 @@ export default function PlantingEntry() {
       width: 150,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button size="small" type="link" icon={<EditOutlined />} disabled={readOnly} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
@@ -277,7 +283,7 @@ export default function PlantingEntry() {
               message.success('栽植记录已删除');
             }}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={readOnly}>
               删除
             </Button>
           </Popconfirm>
@@ -329,10 +335,17 @@ export default function PlantingEntry() {
         />
       ) : null}
 
+      {readOnly ? <Alert type="info" showIcon style={{ marginBottom: 14 }} message={readOnlyReason} /> : null}
+
       <Card
         title="栽植记录"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plotSeedlings.length === 0}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={openCreate}
+            disabled={readOnly || plotSeedlings.length === 0}
+          >
             新增栽植记录
           </Button>
         }
@@ -356,8 +369,8 @@ export default function PlantingEntry() {
           <EmptyPanel
             title="该地块还没有栽植记录"
             description="录入栽植日期、株距与株数，系统会按地块面积自动校验栽植密度是否合理。"
-            actionText="新增栽植记录"
-            onAction={openCreate}
+            actionText={readOnly ? undefined : '新增栽植记录'}
+            onAction={readOnly ? undefined : openCreate}
           />
         ) : (
           <Table<Planting>

@@ -73,7 +73,13 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
+  // v3 新增表对旧存档缺省为空数组，移交标记由导入时按地块状态补齐
+  const snapshot: DatabaseSnapshot = {
+    ...(data as DatabaseSnapshot),
+    handovers: Array.isArray(data.handovers) ? data.handovers : [],
+    careTasks: Array.isArray(data.careTasks) ? data.careTasks : [],
+  };
+  return { ok: true, message: '存档校验通过。', snapshot };
 }
 
 /** 导出全部地块的成活率汇总 CSV */
@@ -91,6 +97,7 @@ export function exportSummaryCsv(
     '底质',
     '修复方式',
     '状态',
+    '移交状态',
     '苗木批次数',
     '进场苗木合计(株)',
     '栽植总株数(株)',
@@ -121,6 +128,7 @@ export function exportSummaryCsv(
         plot.substrate,
         plot.restoreMode,
         plot.state,
+        plot.handoverState,
         plotSeedlings.length,
         plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
         total,

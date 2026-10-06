@@ -10,12 +10,14 @@ import {
   BarChartOutlined,
   DashboardOutlined,
   ExperimentOutlined,
+  ScheduleOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
 import { useReplantStore } from './stores/replantStore';
 import { useSurveyStore } from './stores/surveyStore';
+import { useCareStore } from './stores/careStore';
 import { percentText } from './utils/rate';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -25,6 +27,7 @@ function selectedKey(pathname: string): string {
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
+  if (pathname.startsWith('/care')) return ROUTES.care;
   return ROUTES.plots;
 }
 
@@ -39,12 +42,14 @@ export default function App() {
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
+  const initCare = useCareStore((state) => state.init);
 
   useEffect(() => {
     void loadAll();
     void initSurvey();
     void initReplant();
-  }, [loadAll, initSurvey, initReplant]);
+    void initCare();
+  }, [loadAll, initSurvey, initReplant, initCare]);
 
   const currentPlot = plots.find((plot) => plot.id === currentPlotId) ?? null;
   const currentStat = currentPlot === null ? null : statOf(currentPlot.id);
@@ -70,6 +75,7 @@ export default function App() {
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
+            { key: ROUTES.care, icon: <ScheduleOutlined />, label: '养护作业单' },
           ]}
         />
         <div style={{ padding: '12px 16px', color: 'rgba(217,242,230,0.62)', fontSize: 12, lineHeight: 1.9 }}>
@@ -81,6 +87,9 @@ export default function App() {
           </div>
           <div>
             <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
+          </div>
+          <div>
+            <ScheduleOutlined /> 移交 {counts.handovers ?? 0} · 作业单 {counts.careTasks ?? 0}
           </div>
         </div>
       </Sider>
@@ -113,6 +122,11 @@ export default function App() {
                   {currentStat.surveyCount === 0 ? '尚未验收' : `成活率 ${percentText(currentStat.latestRate)}`}
                 </Tag>
                 <Tag color={currentPlot.missingCount > 0 ? 'orange' : 'green'}>缺株 {currentPlot.missingCount} 株</Tag>
+                {currentPlot.handoverState !== '未移交' ? (
+                  <Tag color={currentPlot.handoverState === '已移交' ? 'purple' : 'default'}>
+                    {currentPlot.handoverState}
+                  </Tag>
+                ) : null}
               </>
             ) : (
               <Tag>未选择地块</Tag>

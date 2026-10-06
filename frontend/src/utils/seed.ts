@@ -1,6 +1,7 @@
 /**
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植
+ * 移交链路：已验收地块 → 移交基线（两边留底）→ 管护作业单（含一条挂起复核）
  * 所有 id 固定，保证 /plots/:id/seedlings、/plots/:id/plantings 深链一定命中真实数据。
  */
 import { db, ROW_REVISION } from './db';
@@ -9,6 +10,8 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
+import type { Handover } from '../types/handover';
+import type { CareTask } from '../types/care';
 import { calcSurvivalRate, rateLevel } from './rate';
 
 const SEED_TIME = '2025-01-06T02:00:00.000Z';
@@ -49,6 +52,14 @@ function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision'>):
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
+function handoverRow(row: Omit<Handover, 'createdAt' | 'updatedAt' | 'revision'>): Handover {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
+function careTaskRow(row: Omit<CareTask, 'createdAt' | 'updatedAt' | 'revision'>): CareTask {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
 /**
  * 播种演示数据。调用方（initDatabase）已保证仅在主表为空时调用，因此天然幂等；
  * 这里再做一次防御：若已存在地块则直接返回。
@@ -67,6 +78,8 @@ export async function seedDatabase(): Promise<void> {
       substrate: '淤泥质',
       restoreMode: '造林',
       state: '跟踪中',
+      handoverState: '未移交',
+      handoverId: '',
       missingCount: 1092,
       lastReplantDate: '',
     }),
@@ -78,6 +91,8 @@ export async function seedDatabase(): Promise<void> {
       substrate: '砂泥质',
       restoreMode: '补植',
       state: '跟踪中',
+      handoverState: '未移交',
+      handoverId: '',
       missingCount: 0,
       lastReplantDate: '2025-04-20',
     }),
@@ -89,6 +104,8 @@ export async function seedDatabase(): Promise<void> {
       substrate: '砂质',
       restoreMode: '造林',
       state: '已验收',
+      handoverState: '已移交',
+      handoverId: 'handover-c1',
       missingCount: 560,
       lastReplantDate: '2024-11-08',
     }),
@@ -139,11 +156,76 @@ export async function seedDatabase(): Promise<void> {
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  // ---------------- 移交基线（北屿外滩 B 区：已验收 → 已移交，两边各自留底） ----------------
+  const plotCAlive = 7440;
+  const plotCTotal = totalByPlot[SEED_IDS.plotC];
+  const plotCBaseline = {
+    totalCount: plotCTotal,
+    aliveCount: plotCAlive,
+    missingCount: plotCTotal - plotCAlive,
+    survivalRate: calcSurvivalRate(plotCAlive, plotCTotal),
+    surveyId: 'survey-c2',
+    round: 2,
+  };
+  const handovers: Handover[] = [
+    handoverRow({
+      id: 'handover-c1',
+      plotId: SEED_IDS.plotC,
+      handoverDate: '2024-09-05',
+      projectCopy: { ...plotCBaseline },
+      maintenanceCopy: { ...plotCBaseline },
+      projectFrozen: true,
+      maintenanceFiled: true,
+    }),
+  ];
+
+  // ---------------- 管护作业单（养护队：正常补苗 / 正常复查 / 挂起复核各 1 条） ----------------
+  const careTasks: CareTask[] = [
+    // 补苗 300 株 ≤ 基线缺株 560 株 → 对账通过
+    careTaskRow({
+      id: 'care-c1',
+      plotId: SEED_IDS.plotC,
+      handoverId: 'handover-c1',
+      kind: '补苗',
+      workDate: '2024-11-10',
+      replantCount: 300,
+      recheckAliveCount: null,
+      state: '正常',
+      suspendReason: '',
+    }),
+    // 复查成活 7700 株 ≤ 基线成活 7440 + 已确认补苗 300 → 对账通过（养护队复查单独记）
+    careTaskRow({
+      id: 'care-c2',
+      plotId: SEED_IDS.plotC,
+      handoverId: 'handover-c1',
+      kind: '复查',
+      workDate: '2024-12-05',
+      replantCount: 0,
+      recheckAliveCount: 7700,
+      state: '正常',
+      suspendReason: '',
+    }),
+    // 补苗 400 株 > 剩余可补 260 株（560 - 300）→ 比基线多出，挂起复核
+    careTaskRow({
+      id: 'care-c3',
+      plotId: SEED_IDS.plotC,
+      handoverId: 'handover-c1',
+      kind: '补苗',
+      workDate: '2025-01-10',
+      replantCount: 400,
+      recheckAliveCount: null,
+      state: '挂起复核',
+      suspendReason: '补苗 400 株比基线多出：基线缺株 560 株，已确认补苗 300 株，剩余可补 260 株',
+    }),
+  ];
+
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.handovers, db.careTasks], async () => {
     await db.plots.bulkPut(plots);
     await db.seedlings.bulkPut(seedlings);
     await db.plantings.bulkPut(plantings);
     await db.surveys.bulkPut(surveys);
     await db.replants.bulkPut(replants);
+    await db.handovers.bulkPut(handovers);
+    await db.careTasks.bulkPut(careTasks);
   });
 }

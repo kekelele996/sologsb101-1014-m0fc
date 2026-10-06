@@ -65,6 +65,7 @@ export default function ReplantPlan() {
   const filters = useReplantStore((state) => state.filters);
   const setFilters = useReplantStore((state) => state.setFilters);
   const resetFilters = useReplantStore((state) => state.resetFilters);
+  const hasSuspendedCare = usePlotStore((state) => state.hasSuspendedCare);
   const drafts = useReplantStore((state) => state.drafts);
   const hasDraft = useReplantStore((state) => state.hasDraft);
   const setDraft = useReplantStore((state) => state.setDraft);
@@ -113,6 +114,9 @@ export default function ReplantPlan() {
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
     };
   }, [rows]);
+
+  /** 有挂起复核作业单的地块：挂起期间不出补植计划 */
+  const suspendedPlots = useMemo(() => plots.filter((plot) => hasSuspendedCare(plot.id)), [plots, hasSuspendedCare]);
 
   const openCreate = (): void => {
     setEditing(null);
@@ -393,6 +397,16 @@ export default function ReplantPlan() {
         <Alert type="info" showIcon style={{ marginBottom: 14 }} message={lastMessage} />
       ) : null}
 
+      {suspendedPlots.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`${suspendedPlots.map((plot) => plot.name).join('、')} 有挂起复核的管护作业单`}
+          description="挂起期间这些地块不出补植计划：新建与一键生成都会被拦截，请先到养护作业单页复核放行或删除挂起单。"
+        />
+      ) : null}
+
       <Card
         title="补植计划与结构版本"
         extra={
@@ -491,7 +505,13 @@ export default function ReplantPlan() {
       >
         <Form form={form} layout="vertical">
           <Form.Item name="plotId" label="地块" rules={[{ required: true, message: '请选择地块' }]}>
-            <Select options={plots.map((plot) => ({ value: plot.id, label: plot.name }))} />
+            <Select
+              options={plots.map((plot) => {
+                const blocked = hasSuspendedCare(plot.id) || plot.handoverState === '待补录';
+                const suffix = hasSuspendedCare(plot.id) ? '（挂起复核中，不可出计划）' : plot.handoverState === '待补录' ? '（待补录，只读）' : '';
+                return { value: plot.id, label: `${plot.name}${suffix}`, disabled: blocked };
+              })}
+            />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item
@@ -515,7 +535,7 @@ export default function ReplantPlan() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率。
+            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率；已移交地块项目部口径冻结，不回写。
           </Typography.Text>
         </Form>
       </Modal>

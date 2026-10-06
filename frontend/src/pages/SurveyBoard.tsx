@@ -117,7 +117,9 @@ export default function SurveyBoard() {
   }, [plots, statOf]);
 
   const openCreate = (): void => {
-    const plotId = filters.plotId !== 'all' ? filters.plotId : plots.length > 0 ? plots[0].id : '';
+    const editable = plots.filter((plot) => plot.handoverState === '未移交');
+    const fallback = editable.length > 0 ? editable[0].id : '';
+    const plotId = filters.plotId !== 'all' && editable.some((plot) => plot.id === filters.plotId) ? filters.plotId : fallback;
     const nextRound = rows.filter((row) => row.plotId === plotId).length + 1;
     setEditing(null);
     form.setFieldsValue({
@@ -187,7 +189,8 @@ export default function SurveyBoard() {
       return;
     }
     const result = await generateReplant(plotId);
-    message.success(result);
+    if (result.startsWith('已生成')) message.success(result);
+    else message.warning(result, 6);
   };
 
   const columns: ColumnsType<Survey> = [
@@ -275,28 +278,50 @@ export default function SurveyBoard() {
       title: '操作',
       key: 'action',
       width: 150,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该测次记录？"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={async () => {
-              await deleteSurvey(record.id);
-              await remove(record.id);
-              message.success('验收记录已删除');
-            }}
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-              删除
+      render: (_value, record) => {
+        const plot = plots.find((item) => item.id === record.plotId);
+        const frozen = plot !== undefined && plot.handoverState !== '未移交';
+        return (
+          <Space size={4}>
+            <Button
+              size="small"
+              type="link"
+              icon={<EditOutlined />}
+              disabled={frozen}
+              title={frozen ? '已移交养护队，项目部验收测次冻结' : undefined}
+              onClick={() => openEdit(record)}
+            >
+              编辑
             </Button>
-          </Popconfirm>
-        </Space>
-      ),
+            <Popconfirm
+              title="确认删除该测次记录？"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={async () => {
+                try {
+                  await deleteSurvey(record.id);
+                  await remove(record.id);
+                  message.success('验收记录已删除');
+                } catch (error) {
+                  message.error(error instanceof Error ? error.message : '删除失败');
+                }
+              }}
+            >
+              <Button
+                size="small"
+                type="link"
+                danger
+                icon={<DeleteOutlined />}
+                disabled={frozen}
+                title={frozen ? '已移交养护队，项目部验收测次冻结' : undefined}
+              >
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -353,7 +378,12 @@ export default function SurveyBoard() {
             <Button icon={<ToolOutlined />} onClick={() => void handleGenerateReplant()}>
               生成补植计划
             </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plots.length === 0}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={openCreate}
+              disabled={plots.filter((plot) => plot.handoverState === '未移交').length === 0}
+            >
               录入测次
             </Button>
           </Space>
@@ -463,7 +493,11 @@ export default function SurveyBoard() {
         <Form form={form} layout="vertical">
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item name="plotId" label="地块" style={{ flex: 2 }} rules={[{ required: true, message: '请选择地块' }]}>
-              <Select options={plots.map((plot) => ({ value: plot.id, label: plot.name }))} />
+              <Select
+                options={plots
+                  .filter((plot) => plot.handoverState === '未移交')
+                  .map((plot) => ({ value: plot.id, label: plot.name }))}
+              />
             </Form.Item>
             <Form.Item name="round" label="测次" style={{ flex: 1 }} rules={[{ required: true, message: '请填写测次' }]}>
               <InputNumber min={1} max={99} style={{ width: '100%' }} />

@@ -104,6 +104,14 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   },
 
   async createReplant(draft) {
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((row) => row.id === draft.plotId);
+    if (plot !== undefined && plot.handoverState === '待补录') {
+      throw new Error('该地块升级时基线未补齐，只读留着，不能出补植计划');
+    }
+    if (plotState.hasSuspendedCare(draft.plotId)) {
+      throw new Error('该地块有挂起复核的管护作业单，挂起期间不出补植计划，请先到养护作业单页复核');
+    }
     const stamp = nowIso();
     const row: Replant = {
       id: uuid('replant'),
@@ -114,7 +122,7 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     };
     await putReplant(row);
     set({ revision: get().revision + 1 });
@@ -138,9 +146,16 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     const next = FLOW[index + 1];
     await advanceReplantState(replantId, next);
     await usePlotStore.getState().refreshCounts();
+    const plot = usePlotStore.getState().plots.find((row) => row.id === existing.plotId);
+    const frozen = plot !== undefined && plot.handoverState === '已移交';
     set({
       revision: get().revision + 1,
-      lastMessage: next === '已补植' ? '已标记补植完成，地块缺株数与成活率已回写' : `状态已推进为「${next}」`,
+      lastMessage:
+        next === '已补植'
+          ? frozen
+            ? '已标记补植完成；该地块已移交，项目部口径冻结，缺株数与成活率不回写'
+            : '已标记补植完成，地块缺株数与成活率已回写'
+          : `状态已推进为「${next}」`,
     });
     return next;
   },

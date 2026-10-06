@@ -28,6 +28,7 @@ import {
   PlusOutlined,
   RiseOutlined,
   FallOutlined,
+  SwapOutlined,
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import FilterBar from '../components/common/FilterBar';
@@ -69,6 +70,7 @@ export default function PlotList() {
   const updatePlot = usePlotStore((state) => state.updatePlot);
   const deletePlot = usePlotStore((state) => state.deletePlot);
   const selectPlot = usePlotStore((state) => state.selectPlot);
+  const handover = usePlotStore((state) => state.handover);
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Plot | null>(null);
@@ -135,6 +137,19 @@ export default function PlotList() {
     }
   };
 
+  const handleHandover = async (plot: Plot): Promise<void> => {
+    const result = await handover(plot.id);
+    if (!result.ok) {
+      message.error(result.message);
+      return;
+    }
+    if (!result.maintenanceOk) {
+      message.warning(result.message, 8);
+      return;
+    }
+    message.success(`「${plot.name}」${result.message}`);
+  };
+
   const columns: ColumnsType<Plot> = [
     {
       title: '地块名',
@@ -186,6 +201,20 @@ export default function PlotList() {
       render: (value: string) => <Tag color={value === '已验收' ? 'green' : 'blue'}>{value}</Tag>,
     },
     {
+      title: '移交',
+      dataIndex: 'handoverState',
+      key: 'handoverState',
+      width: 96,
+      render: (value: Plot['handoverState']) =>
+        value === '已移交' ? (
+          <Tag color="purple">已移交</Tag>
+        ) : value === '待补录' ? (
+          <Tag color="default">待补录·只读</Tag>
+        ) : (
+          <Tag>未移交</Tag>
+        ),
+    },
+    {
       title: '苗木批次',
       key: 'seedlingCount',
       width: 96,
@@ -210,13 +239,14 @@ export default function PlotList() {
     {
       title: '最新成活率',
       key: 'latestRate',
-      width: 190,
+      width: 210,
       render: (_value, record) => {
         const stat = statOf(record.id);
         return (
           <Space size={6} wrap>
             <RateTag rate={stat.surveyCount > 0 ? stat.latestRate : null} level={stat.level} />
-            {stat.surveyCount > 0 && stat.trend !== 0 ? (
+            {record.handoverState === '已移交' ? <Tag color="purple">移交冻结</Tag> : null}
+            {stat.surveyCount > 0 && record.handoverState === '未移交' && stat.trend !== 0 ? (
               <Typography.Text type={stat.trend > 0 ? 'success' : 'danger'} style={{ fontSize: 12 }}>
                 {stat.trend > 0 ? <RiseOutlined /> : <FallOutlined />} {Math.abs(stat.trend)}
               </Typography.Text>
@@ -238,47 +268,71 @@ export default function PlotList() {
     {
       title: '操作',
       key: 'action',
-      width: 260,
+      width: 300,
       fixed: 'right',
-      render: (_value, record) => (
-        <Space size={4} wrap>
-          <Button
-            size="small"
-            type="link"
-            onClick={() => {
-              selectPlot(record.id);
-              navigate(ROUTES.seedlings(record.id));
-            }}
-          >
-            苗木批次
-          </Button>
-          <Button
-            size="small"
-            type="link"
-            onClick={() => {
-              selectPlot(record.id);
-              navigate(ROUTES.plantings(record.id));
-            }}
-          >
-            栽植记录
-          </Button>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该地块？"
-            description="该地块下的苗木批次、栽植记录、验收记录与补植计划会一并删除，且不可恢复。"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={() => void handleDelete(record)}
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-              删除
+      render: (_value, record) => {
+        const readOnly = record.handoverState !== '未移交';
+        const canHandover = record.state === '已验收' && record.handoverState === '未移交';
+        return (
+          <Space size={4} wrap>
+            <Button
+              size="small"
+              type="link"
+              onClick={() => {
+                selectPlot(record.id);
+                navigate(ROUTES.seedlings(record.id));
+              }}
+            >
+              苗木批次
             </Button>
-          </Popconfirm>
-        </Space>
-      ),
+            <Button
+              size="small"
+              type="link"
+              onClick={() => {
+                selectPlot(record.id);
+                navigate(ROUTES.plantings(record.id));
+              }}
+            >
+              栽植记录
+            </Button>
+            {canHandover ? (
+              <Popconfirm
+                title="确认移交给养护队？"
+                description="移交时把栽植总株数、成活株数、缺株数抄成基线两边留底；移交后项目部侧冻结，成活率停在移交当天那版。"
+                okText="移交"
+                cancelText="取消"
+                onConfirm={() => void handleHandover(record)}
+              >
+                <Button size="small" type="link" icon={<SwapOutlined />}>
+                  移交
+                </Button>
+              </Popconfirm>
+            ) : null}
+            <Button
+              size="small"
+              type="link"
+              icon={<EditOutlined />}
+              disabled={readOnly}
+              title={readOnly ? (record.handoverState === '已移交' ? '已移交养护队，项目部侧只读' : '基线待补录，只读') : undefined}
+              onClick={() => openEdit(record)}
+            >
+              编辑
+            </Button>
+            <Popconfirm
+              title="确认删除该地块？"
+              description="该地块下的苗木批次、栽植记录、验收记录、补植计划、移交基线与管护作业单会一并删除，且不可恢复。"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={() => void handleDelete(record)}
+            >
+              <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -348,7 +402,7 @@ export default function PlotList() {
             loading={!ready}
             columns={columns}
             dataSource={rows}
-            scroll={{ x: 1480 }}
+            scroll={{ x: 1620 }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{
               emptyText: (

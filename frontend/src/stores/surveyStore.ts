@@ -84,6 +84,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async createSurvey(draft) {
+    const plot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (plot && plot.handoverState !== '未移交') {
+      throw new Error('该地块已移交养护队，项目部验收测次冻结，养护队复查请在管护作业单登记');
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     const stamp = nowIso();
@@ -99,7 +103,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       gradeManual: false,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     };
     await putSurvey(row);
     set({ revision: get().revision + 1 });
@@ -109,6 +113,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async updateSurvey(surveyId, draft) {
     const existing = await db.surveys.get(surveyId);
     if (!existing) return;
+    const plot = usePlotStore.getState().plots.find((row) => row.id === existing.plotId);
+    if (plot && plot.handoverState !== '未移交') {
+      throw new Error('该地块已移交养护队，项目部验收测次冻结，不允许修改');
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     await putSurvey({
@@ -124,6 +132,11 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async deleteSurvey(surveyId) {
+    const existing = await db.surveys.get(surveyId);
+    const plot = existing ? usePlotStore.getState().plots.find((row) => row.id === existing.plotId) : undefined;
+    if (plot && plot.handoverState !== '未移交') {
+      throw new Error('该地块已移交养护队，项目部验收测次冻结，不允许删除');
+    }
     await removeSurvey(surveyId);
     set({ selectedIds: get().selectedIds.filter((id) => id !== surveyId), revision: get().revision + 1 });
   },
@@ -139,11 +152,22 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
 
   async generateReplant(plotId) {
     const summary = get().summaryOf(plotId);
-    const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
-    const missing = summary.suggestReplant;
+    if (plot.handoverState === '待补录') return '该地块升级时基线未补齐，只读留着，不能出补植计划';
+    // 挂起复核期间不出补植计划
+    if (plotState.hasSuspendedCare(plotId)) {
+      return '该地块有挂起复核的管护作业单，挂起期间不出补植计划，请先到养护作业单页复核';
+    }
+    // 已移交地块按基线剩余缺株出计划；未移交按最新测次派生
+    const handover = plotState.handoverOf(plotId);
+    const missing =
+      handover !== null && handover.projectFrozen
+        ? plotState.statOf(plotId).suggestReplant
+        : summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
-    const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
+    const species = plotState.seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
     const stamp = nowIso();
     await db.replants.put({
       id: uuid('replant'),
@@ -154,7 +178,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;
